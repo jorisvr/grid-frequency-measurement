@@ -4,9 +4,10 @@ Routines for netfreq v3 data processing.
 
 import sys
 import logging
-import time
+import re
 import serial
 import struct
+import time
 from collections import namedtuple
 
 
@@ -46,15 +47,49 @@ class UnwrapTime(object):
         return stamp
 
 
-class FrameReader:
-    """Read binary data packets from the Arduino sketch via serial port."""
+class FrameSyncLost(Exception):
+    """Raised by FrameReader when alignment with input stream is lost."""
+    pass
 
-    # Frame types returned by frame reader.
-    Heartbeat   = namedtuple('HeartbeatFrame', ['host_time', 'board_time'])
-    AcPulse     = namedtuple('AcPulseFrame',   ['host_time', 'start_time', 'end_time'])
-    PpsPulse    = namedtuple('PpsFrame',       ['host_time', 'board_time'])
-    NmeaData    = namedtuple('NmeaFrame',      ['host_time', 'data'])
-    SyncLost    = namedtuple('SyncLost',       ['host_time', 'message'])
+
+class HeartbeatFrame(namedtuple('HeartbeatFrame',
+                                ('host_time', 'board_time'))):
+    """Represents a heartbeat frame from the microprocessor."""
+
+    def __str__(self):
+        return "T %.6f %u" % (self.host_time, self.board_time)
+
+
+class AcPulseFrame(namedtuple('AcPulseFrame',
+                              ('host_time', 'start_time', 'end_time'))):
+    """Represents an AC pulse frame from the microprocessor."""
+
+    def __str__(self):
+        return "A %.6f %u %u" % (self.host_time,
+                                 self.start_time,
+                                 self.end_time)
+
+
+class PpsFrame(namedtuple('PpsFrame',
+                          ('host_time', 'board_time'))):
+    """Represents a PPS frame from the microprocessor."""
+
+    def __str__(self):
+        return "P %.6f %u" % (self.host_time, self.board_time)
+
+
+class NmeaData(namedtuple('NmeaData',
+                          ('host_time', 'data'))):
+    """Represents an NMEA string from the microprocessor."""
+
+    def __str__(self):
+        msg = self.data.decode('ascii', errors='replace')
+        msg = msg.rstrip("\r\n")
+        return 'G %.6f %s' % (self.host_time, msg)
+
+
+class SerialFrameReader:
+    """Read binary data frames from the microprocessor via the serial port."""
 
     # Serial port settings.
     BAUDRATE = 115200
@@ -73,6 +108,10 @@ class FrameReader:
     def __init__(self, port):
         self._dev = serial.Serial(port, baudrate=self.BAUDRATE, timeout=self.TIMEOUT)
         self._dev.reset_input_buffer()
+        self._partial_nmea_data = None
+
+    def close(self):
+        self._dev.close()
 
     def align(self):
         """Align to the binary data stream from the microprocessor.
@@ -85,6 +124,7 @@ class FrameReader:
 
         # Discard pending received data.
         self._dev.reset_input_buffer()
+        self._partial_nmea_data = None
 
         # Temporary read-ahead buffer.
         buf = bytearray()
@@ -146,19 +186,18 @@ class FrameReader:
                 _log.info("Aligned to input stream")
                 return True
 
-        # Alignment failed at ALIGN_MAX_SCAN_BYTES succesive positions.
+        # Alignment failed at ALIGN_MAX_SCAN_BYTES successive positions.
         _log.warning("Failed to align to input stream")
         return False
 
-
     def read_frame(self):
-        """Read one data frame from the microprocessor.
+        """Read one frame from the microprocessor.
 
         If a correct frame is received, return a corresponding frame instance
-        (Heartbeat, AcPulse, PpsPulse, NmeaData).
+        (HeartbeatFrame, AcPulseFrame, PpsFrame, NmeaData).
 
         If an invalid frame is received or timeout occurs,
-        return a SyncLost instance.
+        raise FrameSyncError.
         """
 
         # Read first two bytes of frame.
@@ -182,47 +221,145 @@ class FrameReader:
             plen = hdr[1]
             if plen > self.NMEA_MAX_LENGTH:
                 # Bad NMEA frame length.
-                _log.warning("Lost alignment to input stream")
-                return FrameReader.SyncLost(host_time=host_time,
-                                            message="Alignment lost")
+                _log.warning("Lost alignment to input stream (bad data length")
+                raise FrameSyncError("Alignment lost")
         else:
             # Bad frame type
-            _log.warning("Lost alignment to input stream")
-            return FrameReader.SyncLost(host_time=host_time,
-                                        message="Alignment lost")
+            _log.warning("Lost alignment to input stream (bad frame type)")
+            raise FrameSyncError("Alignment lost")
 
         # Read remaining bytes of frame.
         tail = self._dev.read(plen - 2)
         if len(tail) != plen - 2:
             _log.warning("Timeout while reading frame")
-            return FrameReader.SyncLost(host_time=host_time,
-                                        message="Timeout")
+            raise FrameSyncError("Timeout")
 
         # Verify checksum.
         if ptyp != self.FRAME_ID_NMEA:
             if (sum(hdr) + sum(tail)) & 0xff != 0xff:
                 # Checksum mismatch.
-                _log.warning("Lost alignment to input stream")
-                return FrameReader.SyncLost(host_time=host_time,
-                                            message="Alignment lost")
+                _log.warning("Lost alignment to input stream " +
+                             "(checksum mismatched)")
+                raise FrameSyncError("Alignment lost")
 
         # Decode frame.
         if ptyp == self.FRAME_ID_HEARTBEAT:
             (board_time,) = struct.unpack('<I', tail)
-            return FrameReader.Heartbeat(host_time=host_time,
-                                         board_time=board_time)
+            return HeartbeatFrame(host_time=host_time, board_time=board_time)
         elif ptyp == self.FRAME_ID_ACPULSE:
             (start_time, end_time) = struct.unpack('<II', tail)
-            return FrameReader.AcPulse(host_time=host_time,
-                                       start_time=start_time,
-                                       end_time=end_time)
+            return AcPulseFrame(host_time=host_time,
+                                start_time=start_time,
+                                end_time=end_time)
         elif ptyp == self.FRAME_ID_PPSPULSE:
             (board_time,) = struct.unpack('<I', tail)
-            return FrameReader.PpsPulse(host_time=host_time,
-                                        board_time=board_time)
+            return PpsFrame(host_time=host_time, board_time=board_time)
         elif ptyp == self.FRAME_ID_NMEA:
-            return FrameReader.NmeaData(host_time=host_time,
-                                        data=tail)
+            return NmeaData(host_time=host_time, data=tail)
+
+    def read_message(self):
+        """Read one message from the microprocessor.
+
+        A message corresponds to one frame (HeartbeatFrame, AcPulseFrame,
+        PpsFrame) except in the case of NMEA data, where multiple frames
+        may be concatenated to reconstruct one NMEA message.
+
+        If an invalid frame is received or timeout occurs,
+        raise FrameSyncError.
+        """
+
+        while True:
+
+            frame = self.read_frame()
+            if isinstance(frame, NmeaData):
+                if self._partial_nmea_data is not None:
+                    self._partial_nmea_data += frame.data
+                    if frame.data.endswith(b"\n"):
+                        frame.data = self._partial_nmea_data.rstrip(b"\r\n")
+                        self._partial_nmea_data = b""
+                        return frame
+                elif frame.data.endswith(b"\n"):
+                    self._partial_nmea_data = b""
+            else:
+                return frame
+
+
+class FileFrameReader:
+    """Read pulse frames and NMEA messages from a text file."""
+
+    def __init__(self, filename):
+        self._file = open(filename, "r")
+
+    def close(self):
+        self._file.close()
+
+    def read_message(self):
+        """Read one message from the input file.
+
+        Return a corresponding frame instance (HeartbeatFrame, AcPulseFrame,
+        PpsFrame, NmeaData).
+
+        Raise IOError if reading from the file fails.
+        Raise ValueError if the file contains an invalid data format.
+        Raise FrameSyncLost if the end of the file is reached.
+        """
+
+        s = self._file.readline()
+        if not s.endswith("\n"):
+            # Reached end of file.
+            raise FrameSyncLost("End of file")
+
+        m = re.match(r"^T ([0-9.]+) ([0-9]+)\s*$", s)
+        if m:
+            return HeartbeatFrame(host_time=float(m.group(1)),
+                                  board_time=int(m.group(2)))
+
+        m = re.match(r"^A ([0-9.]+) ([0-9]+) ([0-9]+)\s*$", s)
+        if m:
+            return AcPulseFrame(host_time=float(m.group(1)),
+                                start_time=int(m.group(2)),
+                                end_time=int(m.group(3)))
+
+        m = re.match(r"^P ([0-9.]+) ([0-9]+)\s*$", s)
+        if m:
+            return PpsFrame(host_time=float(m.group(1)),
+                            board_time=int(m.group(2)))
+
+        m = re.match(r"^G ([0-9.]+) (\$.*)\n$", s)
+        if m:
+            return NmeaData(host_time=float(m.group(1)),
+                            data=m.group(2).rstrip("\r\n").encode('ascii'))
+
+        raise ValueError("Invalid message format in input")
+
+
+class NmeaParser:
+    """Parse NMEA messages and extract relevant fields."""
+
+    def process(self, msg):
+        """Process one NmeaData message.
+
+        If the NMEA message is a correctly formatted GPGGA message,
+        extract the time stamp and satellite count and return a corresponding
+        GpsInfo instance.
+
+        Otherwise, if the NMEA message is incorrect or irrelevant, return None.
+        """
+        assert isinstance(msg, NmeaData)
+
+        if msg.data.startswith(b"$GPGGA"):
+
+
+
+            return GpsInfo(host_time=msg.host_time,
+                           utc_time=utc_time,
+                           gps_fix=gps_fix,
+                           nr_satellites=nr_sattellites)
+        pass
+
+
+GpsInfo = namedtuple('GpsInfo',
+                     ('host_time', 'utc_time', 'gps_fix', 'nr_satellites'))
 
 
 def main():
