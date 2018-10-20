@@ -8,84 +8,70 @@ import re
 import serial
 import struct
 import time
-from collections import namedtuple
+
+from typing import NamedTuple, Optional, Tuple, Union
 
 
 # Global logger.
 _log = logging.getLogger("netfreq")
 
 
-class UnwrapTime(object):
-
-    def __init__(self):
-
-        self.laststamp = None
-
-    def unwrap(self, stamp):
-
-        wrap = (1<<32)
-        mask = wrap- 1
-        maxstep = (1<<30)
-
-        assert stamp < wrap
-
-        laststamp = self.laststamp
-        if laststamp is None:
-            laststamp = stamp
-
-        stamp += laststamp - (laststamp & mask)
-
-        if stamp > laststamp + maxstep:
-            stamp -= wrap
-        if stamp + maxstep < laststamp:
-            stamp += wrap
-
-        if stamp + maxstep < laststamp or stamp > laststamp + maxstep:
-            print "W unexpected wrap"
-
-        self.laststamp = stamp
-        return stamp
-
-
-class FrameSyncLost(Exception):
+class FrameSyncError(Exception):
     """Raised by FrameReader when alignment with input stream is lost."""
     pass
 
 
-class HeartbeatFrame(namedtuple('HeartbeatFrame',
-                                ('host_time', 'board_time'))):
-    """Represents a heartbeat frame from the microprocessor."""
+# Represents a heartbeat frame from the front-end microprocessor.
+HeartbeatFrame = NamedTuple('HeartbeatFrame', [
+    ('host_time', float),   # Host timestamp (seconds since Epoch)
+    ('board_time', int)     # Board timestamp (microseconds, 32-bit)
+])
 
-    def __str__(self):
-        return "T %.6f %u" % (self.host_time, self.board_time)
+# Represents an AC pulse frame from the front-end microprocessor.
+AcPulseFrame = NamedTuple('AcPulseFrame', [
+    ('host_time', float),   # Host timestamp (seconds since Epoch)
+    ('start_time', int),    # Start of AC pulse (microseconds, 32-bit)
+    ('end_time', int)       # End of AC pulse (microseconds, 32-bit)
+])
+
+# Represents a PPS frame from the front-end microprocessor.
+PpsFrame = NamedTuple('PpsFrame', [
+    ('host_time', float),   # Host timestamp (seconds since Epoch)
+    ('board_time', int)     # Board timestamp (microseconds, 32-bit)
+])
+
+# Represents an NMEA string from the front-end microprocessor.
+NmeaData = NamedTuple('NmeaData', [
+    ('host_time', float),   # Host timestamp (seconds since Epoch)
+    ('data', bytes)         # Sequence of NMEA data bytes
+])
+
+# GPS fix data extracted from an NMEA $GPGGA message.
+GpsInfo = NamedTuple('GpsInfo', [
+    ('host_time', float),   # Host timestamp (seconds since Epoch)
+    ('utc_time', Tuple[int, int, int]),  # GPS timestamp as tuple (h,m,s) UTC
+    ('gps_fix', int),       # 0 = no fix, 1 = GPS fix, 2 = DGPS fix
+    ('nr_satellites', int)  # Number of satellites in use
+])
+
+# Union of all data frame types.
+_FrameType = Union[HeartbeatFrame, AcPulseFrame, PpsFrame, NmeaData]
 
 
-class AcPulseFrame(namedtuple('AcPulseFrame',
-                              ('host_time', 'start_time', 'end_time'))):
-    """Represents an AC pulse frame from the microprocessor."""
+def init_logging(logfile=None, level=logging.INFO):
+    """Initialize Python logging framework."""
 
-    def __str__(self):
-        return "A %.6f %u %u" % (self.host_time,
-                                 self.start_time,
-                                 self.end_time)
-
-
-class PpsFrame(namedtuple('PpsFrame',
-                          ('host_time', 'board_time'))):
-    """Represents a PPS frame from the microprocessor."""
-
-    def __str__(self):
-        return "P %.6f %u" % (self.host_time, self.board_time)
-
-
-class NmeaData(namedtuple('NmeaData',
-                          ('host_time', 'data'))):
-    """Represents an NMEA string from the microprocessor."""
-
-    def __str__(self):
-        msg = self.data.decode('ascii', errors='replace')
-        msg = msg.rstrip("\r\n")
-        return 'G %.6f %s' % (self.host_time, msg)
+    if logfile is not None:
+        h = logging.FileHandler(logfile, "a")
+    else:
+        h = logging.StreamHandler(sys.stderr)
+    fmt = logging.Formatter(
+        fmt="[%(asctime)s] %(name)s %(levelname)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S")
+    fmt.converter = time.gmtime
+    h.setFormatter(fmt)
+    logging.root.addHandler(h)
+    logging.root.setLevel(level)
 
 
 class SerialFrameReader:
@@ -105,15 +91,19 @@ class SerialFrameReader:
     FRAME_ID_PPSPULSE   = 0x12
     FRAME_ID_NMEA       = 0x13
 
-    def __init__(self, port):
-        self._dev = serial.Serial(port, baudrate=self.BAUDRATE, timeout=self.TIMEOUT)
-        self._dev.reset_input_buffer()
-        self._partial_nmea_data = None
+    NMEA_MAX_LENGTH     = 64
 
-    def close(self):
+    def __init__(self, port) -> None:
+        self._dev = serial.Serial(port,
+                                  baudrate=self.BAUDRATE,
+                                  timeout=self.TIMEOUT)
+        self._dev.reset_input_buffer()
+        self._partial_nmea_data = bytearray()
+
+    def close(self) -> None:
         self._dev.close()
 
-    def align(self):
+    def align(self) -> bool:
         """Align to the binary data stream from the microprocessor.
 
         Return True when alignment succeeded.
@@ -124,7 +114,7 @@ class SerialFrameReader:
 
         # Discard pending received data.
         self._dev.reset_input_buffer()
-        self._partial_nmea_data = None
+        self._partial_nmea_data = bytearray()
 
         # Temporary read-ahead buffer.
         buf = bytearray()
@@ -155,8 +145,9 @@ class SerialFrameReader:
                 elif ptyp == self.FRAME_ID_PPSPULSE:
                     plen = 6
                 elif ptyp == self.FRAME_ID_NMEA:
-                    plen = buf[pos+1]
-                    if plen > self.NMEA_MAX_LENGTH:
+                    datalen = buf[pos+1]
+                    plen = 2 + datalen
+                    if datalen > self.NMEA_MAX_LENGTH:
                         # Bad NMEA frame length - retry alignment.
                         break
                 else:
@@ -190,7 +181,7 @@ class SerialFrameReader:
         _log.warning("Failed to align to input stream")
         return False
 
-    def read_frame(self):
+    def read_frame(self) -> _FrameType:
         """Read one frame from the microprocessor.
 
         If a correct frame is received, return a corresponding frame instance
@@ -201,25 +192,42 @@ class SerialFrameReader:
         """
 
         # Read first two bytes of frame.
-        rawframe = self._dev.read(2)
+        hdr = self._dev.read(2)
         host_time = time.time()
 
-        if len(rawframe) != 2:
+        if len(hdr) != 2:
             _log.warning("Timeout while reading frame")
-            return FrameReader.SyncLost(host_time=host_time,
-                                        message="Timeout")
+            raise FrameSyncError("Timeout")
 
         # Determine frame length.
-        ptyp = rawframe[0]
+        ptyp = hdr[0]
         if ptyp == self.FRAME_ID_HEARTBEAT:
+            # 6 bytes
+            # byte 0     = 0x10
+            # byte 1     = checksum
+            # bytes 2..5 = (uint32_le) timestamp
             plen = 6
         elif ptyp == self.FRAME_ID_ACPULSE:
+            # 10 bytes
+            # byte 0     = 0x11
+            # byte 1     = checksum
+            # bytes 2..5 = (uint32_le) timestamp of pulse start
+            # bytes 5..9 = (uint32_le) timestamp of pulse end
             plen = 10
         elif ptyp == self.FRAME_ID_PPSPULSE:
+            # 6 bytes
+            # byte 0     = 0x12
+            # byte 1     = checksum
+            # bytes 2..5 = (uint32_le) timestamp of PPS pulse
             plen = 6
         elif ptyp == self.FRAME_ID_NMEA:
-            plen = hdr[1]
-            if plen > self.NMEA_MAX_LENGTH:
+            # 3..62 bytes
+            # byte 0     = 0x13
+            # byte 1     = data length (range 1..60)
+            # byte 2..   = 1..60 bytes NMEA string data
+            datalen = hdr[1]
+            plen = 2 + datalen
+            if datalen > self.NMEA_MAX_LENGTH:
                 # Bad NMEA frame length.
                 _log.warning("Lost alignment to input stream (bad data length")
                 raise FrameSyncError("Alignment lost")
@@ -257,7 +265,7 @@ class SerialFrameReader:
         elif ptyp == self.FRAME_ID_NMEA:
             return NmeaData(host_time=host_time, data=tail)
 
-    def read_message(self):
+    def read_message(self) -> _FrameType:
         """Read one message from the microprocessor.
 
         A message corresponds to one frame (HeartbeatFrame, AcPulseFrame,
@@ -272,28 +280,44 @@ class SerialFrameReader:
 
             frame = self.read_frame()
             if isinstance(frame, NmeaData):
-                if self._partial_nmea_data is not None:
-                    self._partial_nmea_data += frame.data
-                    if frame.data.endswith(b"\n"):
-                        frame.data = self._partial_nmea_data.rstrip(b"\r\n")
-                        self._partial_nmea_data = b""
-                        return frame
-                elif frame.data.endswith(b"\n"):
-                    self._partial_nmea_data = b""
+                self._partial_nmea_data += frame.data
+                if frame.data.endswith(b"\n"):
+                    nmea_data = bytes(self._partial_nmea_data.rstrip(b"\r\n"))
+                    self._partial_nmea_data = bytearray()
+                    return NmeaData(host_time=frame.host_time,
+                                    data=nmea_data)
             else:
                 return frame
+
+
+def frame_to_text(frame: _FrameType) -> str:
+    """Serialize a data frame to a single-line ASCII string."""
+
+    if isinstance(frame, HeartbeatFrame):
+        return "T %.6f %u" % (frame.host_time, frame.board_time)
+    elif isinstance(frame, AcPulseFrame):
+        return "A %.6f %u %u" % (frame.host_time,
+                                 frame.start_time,
+                                 frame.end_time)
+    elif isinstance(frame, PpsFrame):
+        return "P %.6f %u" % (frame.host_time, frame.board_time)
+    elif isinstance(frame, NmeaData):
+        msg = frame.data.rstrip(b"\r\n").decode('ascii', errors='replace')
+        return 'G %.6f %s' % (frame.host_time, msg)
+    else:
+        assert False
 
 
 class FileFrameReader:
     """Read pulse frames and NMEA messages from a text file."""
 
-    def __init__(self, filename):
+    def __init__(self, filename) -> None:
         self._file = open(filename, "r")
 
-    def close(self):
+    def close(self) -> None:
         self._file.close()
 
-    def read_message(self):
+    def read_message(self) -> _FrameType:
         """Read one message from the input file.
 
         Return a corresponding frame instance (HeartbeatFrame, AcPulseFrame,
@@ -301,13 +325,13 @@ class FileFrameReader:
 
         Raise IOError if reading from the file fails.
         Raise ValueError if the file contains an invalid data format.
-        Raise FrameSyncLost if the end of the file is reached.
+        Raise FrameSyncError if the end of the file is reached.
         """
 
         s = self._file.readline()
         if not s.endswith("\n"):
             # Reached end of file.
-            raise FrameSyncLost("End of file")
+            raise FrameSyncError("End of file")
 
         m = re.match(r"^T ([0-9.]+) ([0-9]+)\s*$", s)
         if m:
@@ -336,7 +360,20 @@ class FileFrameReader:
 class NmeaParser:
     """Parse NMEA messages and extract relevant fields."""
 
-    def process(self, msg):
+    @staticmethod
+    def _verify_checksum(data: bytes) -> Tuple[bool, bytes]:
+        """Verify NMEA checksum and remove checksum from NMEA message."""
+        m = re.match(br"^\$([^*]*)\*([0-9a-fA-F]{2})$", data)
+        if m:
+            msg = m.group(1)
+            got_checksum = int(m.group(2), 16)
+            calc_checksum = 0
+            for b in msg:
+                calc_checksum ^= b
+            return ((calc_checksum == got_checksum), msg)
+        return (False, b"")
+
+    def process(self, msg: NmeaData) -> Optional[GpsInfo]:
         """Process one NmeaData message.
 
         If the NMEA message is a correctly formatted GPGGA message,
@@ -347,100 +384,43 @@ class NmeaParser:
         """
         assert isinstance(msg, NmeaData)
 
-        if msg.data.startswith(b"$GPGGA"):
+        if not msg.data.startswith(b"$GPGGA,"):
+            # Not a GPGGA message.
+            return None
 
+        (checksum_ok, msg_stripped) = self._verify_checksum(msg.data)
+        if not checksum_ok:
+            _log.warning("Checksum mismatch in NMEA message %s", msg.data)
+            return None
 
+        msg_fields = msg_stripped.split(b",")
+        assert msg_fields[0] == b"GPGGA"
+        if len(msg_fields) != 15:
+            _log.warning("Invalid GPGGA format in NMEA message %s", msg.data)
+            return None
 
-            return GpsInfo(host_time=msg.host_time,
-                           utc_time=utc_time,
-                           gps_fix=gps_fix,
-                           nr_satellites=nr_sattellites)
-        pass
+        if len(msg_fields[1]) < 6:
+            _log.warning("Invalid timestamp in NMEA message %s", msg.data)
+            return None
 
+        try:
+            utc_hour = int(msg_fields[1][0:2])
+            utc_min = int(msg_fields[1][2:4])
+            utc_sec = int(msg_fields[1][4:6])
+            gps_fix = int(msg_fields[6])
+            nr_satellites = int(msg_fields[7])
+        except ValueError:
+            _log.warning("Invalid GPGGA format in NMEA message %s", msg.data)
+            return None
 
-GpsInfo = namedtuple('GpsInfo',
-                     ('host_time', 'utc_time', 'gps_fix', 'nr_satellites'))
+        if ((utc_hour < 0) or (utc_hour > 23)
+                or (utc_min < 0) or (utc_min > 59)
+                or (utc_sec < 0) or (utc_sec > 60)):
+            _log.warning("Invalid timestamp in NMEA message %s", msg.data)
+            return None
 
-
-def main():
-
-    if len(sys.argv) != 2:
-        print >>sys.stderr, __doc__
-        sys.exit(1)
-
-    devname = sys.argv[1]
-
-    dev = serial.Serial(devname, 115200, 8, 'N', 1, timeout=5)
-    dev.flushInput()
-    dev.read(2)
-    dev.flushInput()
-
-    print >>sys.stderr, "Aligning with data stream (1)"
-
-    # Align with data stream
-    retry = 0
-    ngood = 0
-    while ngood < 3 and retry < 10:
-
-        pkt = readPacket(dev, initAlign=(ngood == 0))
-        if pkt is None:
-            print >>sys.stderr, "Timeout while reading from serial port"
-            ngood = 0
-            retry += 1
-
-        elif pkt == ():
-            ngood = 0
-            retry += 1
-
-        else:
-            if ngood == 0:
-                print >>sys.stderr, "Aligning with data stream (2)"
-            ngood += 1
-
-    if ngood == 0:
-        # Abort after too many failures.
-        print >>sys.stderr, "ERROR: Failed to align with data stream"
-        sys.exit(1)
-
-    print >>sys.stderr, "Aligned to data stream"
-
-    unwrapper = UnwrapTime()
-    nmeabuffer = ""
-
-    # Read data
-    while True:
-
-        pkt = readPacket(dev)
-
-        if pkt is None:
-            print >>sys.stderr, "ERROR: Timeout while reading from serial port"
-            break
-
-        elif pkt == ():
-            break
-
-        elif pkt[0] == pktHeartbeatId:
-            print "T %.6f %u" % (pkt[1], pkt[2])
-            sys.stdout.flush()
-
-        elif pkt[0] == pktAcPulseId:
-            print "A %.6f %u %u" % (pkt[1], pkt[2], pkt[3])
-            sys.stdout.flush()
-
-        elif pkt[0] == pktPpsPulseId:
-            print "P %.6f %u" % (pkt[1], pkt[2])
-            sys.stdout.flush()
-
-        elif pkt[0] == pktNmeaId:
-            nmeabuffer += pkt[2]
-            if nmeabuffer.endswith("\n"):
-                print "G %.6f %s" % (pkt[1], nmeabuffer.rstrip())
-                sys.stdout.flush()
-                nmeabuffer = ""
-
-        else:
-            break
-
-    print >>sys.stderr, "ERROR: Lost alignment with data stream"
-    sys.exit(1)
+        return GpsInfo(host_time=msg.host_time,
+                       utc_time=(utc_hour, utc_min, utc_sec),
+                       gps_fix=gps_fix,
+                       nr_satellites=nr_satellites)
 
